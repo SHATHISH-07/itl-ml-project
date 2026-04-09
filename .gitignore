@@ -1,0 +1,18 @@
+# Ignore the data folder and all its contents
+data/
+
+# Ignore Python cache directories and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+env/
+
+.env
+
+model/
+checkpoints/
+*.ckpt
+
+lightning_logs/
