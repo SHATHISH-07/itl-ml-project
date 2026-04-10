@@ -15,6 +15,9 @@ training_status = {
     "status": "idle", "progress": 0, "last_error": None, "last_trained": None, "message": "Ready"
 }
 
+# =========================
+# ✅ PREPROCESS DATA
+# =========================
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df["Week"] = pd.to_datetime(df["Week"])
     df = df.sort_values(["Employee_ID", "Week"])
@@ -22,7 +25,6 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df["time_idx"] = df.groupby("Employee_ID").cumcount()
     df["Employee_ID_encoded"] = df["Employee_ID"].astype("category").cat.codes
 
-    # ✅ CORRECT LAG FEATURES
     df["lag_1_score"] = df.groupby("Employee_ID")["Project_Score"].shift(1)
     df["lag_2_score"] = df.groupby("Employee_ID")["Project_Score"].shift(2)
     df["lag_3_score"] = df.groupby("Employee_ID")["Project_Score"].shift(3)
@@ -30,11 +32,9 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df["lag_1_hours"] = df.groupby("Employee_ID")["Hours_Worked"].shift(1)
     df["lag_2_hours"] = df.groupby("Employee_ID")["Hours_Worked"].shift(2)
 
-    # ✅ ROLLING FEATURES
     df["rolling_score"] = df.groupby("Employee_ID")["Project_Score"].rolling(3).mean().reset_index(0, drop=True)
     df["rolling_hours"] = df.groupby("Employee_ID")["Hours_Worked"].rolling(3).mean().reset_index(0, drop=True)
 
-    # ✅ DERIVED FEATURES
     df["task_pressure"] = df["Tasks_Completed"] / (df["Hours_Worked"] + 1)
 
     df["score_change"] = df.groupby("Employee_ID")["Project_Score"].diff()
@@ -44,11 +44,14 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df["weekofyear"] = df["Week"].dt.isocalendar().week.astype(int)
     df["day_of_week"] = df["Week"].dt.dayofweek
 
-    # ✅ FILL MISSING VALUES
     df = df.bfill().ffill()
 
     return df
 
+
+# =========================
+# ✅ CREATE DATASETS
+# =========================
 def create_datasets(df: pd.DataFrame):
     training_cutoff = df["time_idx"].max() - loader.max_prediction_length
 
@@ -64,7 +67,7 @@ def create_datasets(df: pd.DataFrame):
 
         static_categoricals=["Department", "Role"],
 
-        # ❌ REMOVE LEAKAGE
+        # ✅ NO LEAKAGE
         time_varying_unknown_reals=[],
 
         time_varying_known_reals=[
@@ -87,79 +90,138 @@ def create_datasets(df: pd.DataFrame):
 
     validation = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
 
-    return training, validation, training.to_dataloader(train=True, batch_size=32), validation.to_dataloader(train=False, batch_size=32)
+    train_loader = training.to_dataloader(train=True, batch_size=32, num_workers=2)
+    val_loader = validation.to_dataloader(train=False, batch_size=32, num_workers=2)
 
+    return training, validation, train_loader, val_loader
+
+
+# =========================
+# ✅ TRAINING PIPELINE (FIXED)
+# =========================
 def run_training_pipeline():
     global training_status
+
     try:
-        training_status.update({"status": "training", "progress": 10, "message": "Preprocessing data..."})
+        training_status.update({"status": "training", "progress": 10, "message": "Preprocessing..."})
+
         df = pd.read_json("data/employee_data.json")
-        training, validation, train_loader, val_loader = create_datasets(preprocess_data(df))
-        
-        training_status.update({"progress": 30, "message": "Building model architecture..."})
+        df = preprocess_data(df)
+
+        training, validation, train_loader, val_loader = create_datasets(df)
+
+        training_status.update({"progress": 30, "message": "Building model..."})
+
         tft = TemporalFusionTransformer.from_dataset(
-            training, learning_rate=0.005, hidden_size=64, loss=QuantileLoss(),
-            output_size=[len(QuantileLoss().quantiles)] * len(loader.targets)
+            training,
+            learning_rate=0.003,
+            hidden_size=128,
+            attention_head_size=4,
+            dropout=0.1,
+            hidden_continuous_size=32,
+            loss=QuantileLoss(),
+            output_size=[len(QuantileLoss().quantiles)] * len(loader.targets),
+        )
+
+        checkpoint_callback = ModelCheckpoint(
+            dirpath="model",
+            filename="best_tft",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1
+        )
+
+        early_stop = EarlyStopping(
+            monitor="val_loss",
+            patience=5,
+            mode="min"
         )
 
         trainer = pl.Trainer(
-            max_epochs=30, accelerator="auto", 
-            callbacks=[ModelCheckpoint(dirpath="model", filename="tft_model", save_top_k=1)],
-            gradient_clip_val=0.1, logger=False
+            max_epochs=40,
+            accelerator="auto",
+            gradient_clip_val=0.1,
+            callbacks=[checkpoint_callback, early_stop],
+            logger=False
         )
 
-        training_status.update({"progress": 50, "message": "Model training in progress..."})
+        training_status.update({"progress": 60, "message": "Training..."})
+
         trainer.fit(tft, train_loader, val_loader)
-        
-        loader.reload_data_and_tft()
+
+        # ✅ LOAD BEST MODEL
+        best_model_path = checkpoint_callback.best_model_path
+        print(f"Best model saved at: {best_model_path}")
+
+        if best_model_path:
+            loader.tft_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+            loader.tft_model.eval()
+
         training_status.update({
-            "status": "completed", "progress": 100, "message": "Model updated!",
+            "status": "completed",
+            "progress": 100,
+            "message": "Training complete!",
             "last_trained": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
-    except Exception as e:
-        training_status.update({"status": "failed", "last_error": str(e), "message": "Error during training."})
 
+    except Exception as e:
+        training_status.update({
+            "status": "failed",
+            "last_error": str(e),
+            "message": "Training failed"
+        })
+
+
+# =========================
+# ✅ EVALUATION (SAFE)
+# =========================
 def evaluate_current_model() -> dict:
-    if not loader.tft_model or not loader.val_loader:
+    if loader.tft_model is None or loader.val_loader is None:
         return {"error": "Model not loaded"}
 
-    actuals_list = []
-    for batch in loader.val_loader:
-        x, y = batch
-        target = y[0]
-        if isinstance(target, (list, tuple)):
-            target = torch.stack(list(target), dim=-1)
-        actuals_list.append(target)
+    try:
+        actuals_list = []
 
-    actuals = torch.cat(actuals_list).cpu().numpy()
+        for batch in loader.val_loader:
+            x, y = batch
+            target = y[0]
+            if isinstance(target, (list, tuple)):
+                target = torch.stack(list(target), dim=-1)
+            actuals_list.append(target)
 
-    preds = loader.tft_model.predict(loader.val_loader)
+        actuals = torch.cat(actuals_list).cpu().numpy()
 
-    if isinstance(preds, (list, tuple)):
-        preds = torch.stack(list(preds), dim=-1)
+        preds = loader.tft_model.predict(loader.val_loader)
 
-    preds = preds.cpu().numpy()
+        if isinstance(preds, (list, tuple)):
+            preds = torch.stack(list(preds), dim=-1)
 
-    # ✅ TAKE MEDIAN
-    preds = preds[..., 0]
+        preds = preds.cpu().numpy()
 
-    actuals = actuals.reshape(-1, len(loader.targets))
-    preds = preds.reshape(-1, len(loader.targets))
+        # ✅ FIX
+        preds = preds[..., 0]
 
-    results = {}
-    for i, col in enumerate(loader.targets):
-        mae = mean_absolute_error(actuals[:, i], preds[:, i])
-        rmse = np.sqrt(mean_squared_error(actuals[:, i], preds[:, i]))
+        actuals = actuals.reshape(-1, len(loader.targets))
+        preds = preds.reshape(-1, len(loader.targets))
 
-        if np.var(actuals[:, i]) == 0:
-            r2 = 1.0 if mae == 0 else 0.0
-        else:
-            r2 = r2_score(actuals[:, i], preds[:, i])
+        results = {}
 
-        results[col] = {
-            "MAE": round(mae, 4),
-            "RMSE": round(rmse, 4),
-            "R2": round(r2, 4)
-        }
+        for i, col in enumerate(loader.targets):
+            mae = mean_absolute_error(actuals[:, i], preds[:, i])
+            rmse = np.sqrt(mean_squared_error(actuals[:, i], preds[:, i]))
 
-    return results
+            if np.var(actuals[:, i]) == 0:
+                r2 = 1.0 if mae == 0 else 0.0
+            else:
+                r2 = r2_score(actuals[:, i], preds[:, i])
+
+            results[col] = {
+                "MAE": round(mae, 4),
+                "RMSE": round(rmse, 4),
+                "R2": round(r2, 4)
+            }
+
+        return results
+
+    except Exception as e:
+        return {"error": str(e)}

@@ -24,6 +24,13 @@ async def process_query(request: QueryRequest):
     profile = analysis.get_employee_profile(request.employee_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Employee not found")
+    
+    if request.analysis_type == "custom_past":
+        if not request.start_date or not request.end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date and end_date are required for custom_past"
+        )
         
     try:
         result = analysis.run_employee_analysis(
