@@ -12,7 +12,11 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from core import loader
 
 training_status = {
-    "status": "idle", "progress": 0, "last_error": None, "last_trained": None, "message": "Ready"
+    "status": "idle",
+    "progress": 0,
+    "last_error": None,
+    "last_trained": None,
+    "message": "Ready"
 }
 
 # =========================
@@ -67,8 +71,7 @@ def create_datasets(df: pd.DataFrame):
 
         static_categoricals=["Department", "Role"],
 
-        # ✅ NO LEAKAGE
-        time_varying_unknown_reals=[],
+        time_varying_unknown_reals=[],  # no leakage
 
         time_varying_known_reals=[
             "time_idx", "lag_1_score", "lag_2_score", "lag_3_score",
@@ -88,7 +91,9 @@ def create_datasets(df: pd.DataFrame):
         add_encoder_length=True,
     )
 
-    validation = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
+    validation = TimeSeriesDataSet.from_dataset(
+        training, df, predict=True, stop_randomization=True
+    )
 
     train_loader = training.to_dataloader(train=True, batch_size=32, num_workers=2)
     val_loader = validation.to_dataloader(train=False, batch_size=32, num_workers=2)
@@ -97,7 +102,7 @@ def create_datasets(df: pd.DataFrame):
 
 
 # =========================
-# ✅ TRAINING PIPELINE (FIXED)
+# ✅ TRAINING PIPELINE
 # =========================
 def run_training_pipeline():
     global training_status
@@ -151,11 +156,15 @@ def run_training_pipeline():
 
         # ✅ LOAD BEST MODEL
         best_model_path = checkpoint_callback.best_model_path
-        print(f"Best model saved at: {best_model_path}")
+        print("Best model:", best_model_path)
 
         if best_model_path:
             loader.tft_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
             loader.tft_model.eval()
+
+            # 🔥 CRITICAL FIX
+            loader.val_loader = val_loader
+            loader.training_dataset = training
 
         training_status.update({
             "status": "completed",
@@ -173,11 +182,15 @@ def run_training_pipeline():
 
 
 # =========================
-# ✅ EVALUATION (SAFE)
+# ✅ EVALUATION
 # =========================
 def evaluate_current_model() -> dict:
-    if loader.tft_model is None or loader.val_loader is None:
-        return {"error": "Model not loaded"}
+
+    if loader.tft_model is None:
+        return {"error": "Model not trained"}
+
+    if loader.val_loader is None:
+        return {"error": "Validation loader missing"}
 
     try:
         actuals_list = []
@@ -185,8 +198,10 @@ def evaluate_current_model() -> dict:
         for batch in loader.val_loader:
             x, y = batch
             target = y[0]
+
             if isinstance(target, (list, tuple)):
                 target = torch.stack(list(target), dim=-1)
+
             actuals_list.append(target)
 
         actuals = torch.cat(actuals_list).cpu().numpy()
@@ -198,11 +213,17 @@ def evaluate_current_model() -> dict:
 
         preds = preds.cpu().numpy()
 
-        # ✅ FIX
+        # ✅ REMOVE QUANTILE DIM
         preds = preds[..., 0]
 
-        actuals = actuals.reshape(-1, len(loader.targets))
-        preds = preds.reshape(-1, len(loader.targets))
+        # ✅ ALIGN LENGTH
+        min_len = min(actuals.shape[0], preds.shape[0])
+        actuals = actuals[:min_len]
+        preds = preds[:min_len]
+
+        # ✅ FLATTEN
+        actuals = actuals.reshape(-1, actuals.shape[-1])
+        preds = preds.reshape(-1, preds.shape[-1])
 
         results = {}
 

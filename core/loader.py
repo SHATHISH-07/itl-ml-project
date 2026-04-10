@@ -42,7 +42,7 @@ def reload_data_and_tft():
     new_df = preprocess_data(new_df)
     new_train_ds, _, _, new_val_loader = create_datasets(new_df)
 
-    model_path = "model/tft_model.ckpt"
+    model_path = "model/best_tft.ckpt"
     new_tft = None
     if os.path.exists(model_path):
         new_tft = TemporalFusionTransformer.load_from_checkpoint(model_path)
