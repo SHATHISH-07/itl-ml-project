@@ -3,6 +3,7 @@ import torch
 from pytorch_forecasting import TimeSeriesDataSet
 from core import loader
 from services.training_service import training_status
+import numpy as np
 
 def predict_future_metrics(emp_df: pd.DataFrame) -> dict:
     from core import loader
